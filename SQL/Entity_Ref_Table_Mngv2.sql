@@ -31,8 +31,6 @@ CREATE OR REPLACE PROCEDURE <DATABASE>.ref.sp_upsert_entity(
     p_entity_short_code VARCHAR,
     p_entity_type       VARCHAR,
     p_parent_entity_id  VARCHAR,
-    p_country_code      VARCHAR,
-    p_timezone          VARCHAR,
     p_is_active         BOOLEAN,
     p_effective_from    DATE,
     p_effective_to      DATE,
@@ -47,8 +45,6 @@ RETURNS TABLE (
     entity_short_code   VARCHAR,
     entity_type         VARCHAR,
     parent_entity_id    VARCHAR,
-    country_code        VARCHAR,
-    timezone            VARCHAR,
     is_active           BOOLEAN,
     effective_from      DATE,
     effective_to        DATE,
@@ -136,7 +132,7 @@ BEGIN
         SELECT COUNT(*)
         INTO   v_parent_count
         FROM   <DATABASE>.ref.entity
-        WHERE  entity_id = p_parent_entity_id;
+        WHERE  entity_id = :p_parent_entity_id;
 
         IF (v_parent_count = 0) THEN
             RAISE err_parent_not_found;
@@ -145,7 +141,7 @@ BEGIN
         SELECT is_active
         INTO   v_parent_active
         FROM   <DATABASE>.ref.entity
-        WHERE  entity_id = p_parent_entity_id;
+        WHERE  entity_id = :p_parent_entity_id;
 
         IF (NOT v_parent_active) THEN
             RAISE err_parent_inactive;
@@ -158,7 +154,7 @@ BEGIN
     SELECT COUNT(*)
     INTO   v_existing_count
     FROM   <DATABASE>.ref.entity
-    WHERE  entity_id = p_entity_id;
+    WHERE  entity_id = :p_entity_id;
 
     IF (v_existing_count = 0) THEN
         v_action := 'INSERT';
@@ -172,15 +168,13 @@ BEGIN
 
         INSERT INTO <DATABASE>.ref.entity (
             entity_id, entity_name, entity_short_code, entity_type,
-            parent_entity_id, country_code, timezone,
-            is_active, effective_from, effective_to, notes,
+            parent_entity_id, is_active, effective_from, effective_to, notes,
             created_at, updated_at, updated_by
         )
         VALUES (
-            p_entity_id, p_entity_name, p_entity_short_code, UPPER(p_entity_type),
-            p_parent_entity_id, p_country_code, p_timezone,
-            p_is_active, p_effective_from, p_effective_to, p_notes,
-            v_now, v_now, p_updated_by
+            :p_entity_id, :p_entity_name, :p_entity_short_code, UPPER(:p_entity_type),
+            :p_parent_entity_id, :p_is_active, :p_effective_from, :p_effective_to, :p_notes,
+            :v_now, :v_now, :p_updated_by
         );
 
         v_change_summary := 'INSERT: new entity ' || p_entity_id
@@ -190,19 +184,17 @@ BEGIN
 
         UPDATE <DATABASE>.ref.entity
         SET
-            entity_name         = p_entity_name,
-            entity_short_code   = p_entity_short_code,
-            entity_type         = UPPER(p_entity_type),
-            parent_entity_id    = p_parent_entity_id,
-            country_code        = p_country_code,
-            timezone            = p_timezone,
-            is_active           = p_is_active,
-            effective_from      = p_effective_from,
-            effective_to        = p_effective_to,
-            notes               = p_notes,
-            updated_at          = v_now,
-            updated_by          = p_updated_by
-        WHERE entity_id = p_entity_id;
+            entity_name         = :p_entity_name,
+            entity_short_code   = :p_entity_short_code,
+            entity_type         = UPPER(:p_entity_type),
+            parent_entity_id    = :p_parent_entity_id,
+            is_active           = :p_is_active,
+            effective_from      = :p_effective_from,
+            effective_to        = :p_effective_to,
+            notes               = :p_notes,
+            updated_at          = :v_now,
+            updated_by          = :p_updated_by
+        WHERE entity_id = :p_entity_id;
 
         v_change_summary := 'UPDATE: entity ' || p_entity_id
                          || ' (' || p_entity_name || ') updated by ' || p_updated_by;
@@ -215,29 +207,27 @@ BEGIN
         change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        v_now, 'ref.entity', p_entity_id, v_action, p_updated_by, v_change_summary
+        :v_now, 'ref.entity', :p_entity_id, :v_action, :p_updated_by, :v_change_summary
     );
 
     SELECT MAX(change_id)
     INTO   v_change_id
     FROM   <DATABASE>.ref.change_log
     WHERE  table_name       = 'ref.entity'
-    AND    record_id        = p_entity_id
-    AND    change_timestamp = v_now;
+    AND    record_id        = :p_entity_id
+    AND    change_timestamp = :v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
     v_result := (
         SELECT
-            v_action        AS action,
-            v_change_id     AS change_id,
+            :v_action       AS action,
+            :v_change_id    AS change_id,
             entity_id,
             entity_name,
             entity_short_code,
             entity_type,
             parent_entity_id,
-            country_code,
-            timezone,
             is_active,
             effective_from,
             effective_to,
@@ -246,7 +236,7 @@ BEGIN
             updated_at,
             updated_by
         FROM <DATABASE>.ref.entity
-        WHERE entity_id = p_entity_id
+        WHERE entity_id = :p_entity_id
     );
 
     RETURN TABLE(v_result);
@@ -383,7 +373,7 @@ BEGIN
         SELECT COUNT(*)
         INTO   v_entity_count
         FROM   <DATABASE>.ref.entity
-        WHERE  entity_id = p_owning_entity_id;
+        WHERE  entity_id = :p_owning_entity_id;
 
         IF (v_entity_count = 0) THEN
             RAISE err_entity_not_found;
@@ -392,7 +382,7 @@ BEGIN
         SELECT is_active
         INTO   v_entity_active
         FROM   <DATABASE>.ref.entity
-        WHERE  entity_id = p_owning_entity_id;
+        WHERE  entity_id = :p_owning_entity_id;
 
         IF (NOT v_entity_active) THEN
             RAISE err_entity_inactive;
@@ -405,7 +395,7 @@ BEGIN
     SELECT COUNT(*)
     INTO   v_existing_count
     FROM   <DATABASE>.ref.source_system
-    WHERE  source_system_id = p_source_system_id;
+    WHERE  source_system_id = :p_source_system_id;
 
     IF (v_existing_count = 0) THEN
         v_action := 'INSERT';
@@ -425,11 +415,11 @@ BEGIN
             created_at, updated_at, updated_by
         )
         VALUES (
-            p_source_system_id, p_source_system_name, UPPER(p_source_system_category),
-            p_description, p_owning_entity_id, p_owner_team, p_owner_contact,
-            UPPER(p_connection_type), UPPER(p_environment), p_is_active,
-            p_onboarded_date, p_decommissioned_date, p_notes,
-            v_now, v_now, p_updated_by
+            :p_source_system_id, :p_source_system_name, UPPER(:p_source_system_category),
+            :p_description, :p_owning_entity_id, :p_owner_team, :p_owner_contact,
+            UPPER(:p_connection_type), UPPER(:p_environment), :p_is_active,
+            :p_onboarded_date, :p_decommissioned_date, :p_notes,
+            :v_now, :v_now, :p_updated_by
         );
 
         v_change_summary := 'INSERT: new source system ' || p_source_system_id
@@ -439,21 +429,21 @@ BEGIN
 
         UPDATE <DATABASE>.ref.source_system
         SET
-            source_system_name      = p_source_system_name,
-            source_system_category  = UPPER(p_source_system_category),
-            description             = p_description,
-            owning_entity_id        = p_owning_entity_id,
-            owner_team              = p_owner_team,
-            owner_contact           = p_owner_contact,
-            connection_type         = UPPER(p_connection_type),
-            environment             = UPPER(p_environment),
-            is_active               = p_is_active,
-            onboarded_date          = p_onboarded_date,
-            decommissioned_date     = p_decommissioned_date,
-            notes                   = p_notes,
-            updated_at              = v_now,
-            updated_by              = p_updated_by
-        WHERE source_system_id = p_source_system_id;
+            source_system_name      = :p_source_system_name,
+            source_system_category  = UPPER(:p_source_system_category),
+            description             = :p_description,
+            owning_entity_id        = :p_owning_entity_id,
+            owner_team              = :p_owner_team,
+            owner_contact           = :p_owner_contact,
+            connection_type         = UPPER(:p_connection_type),
+            environment             = UPPER(:p_environment),
+            is_active               = :p_is_active,
+            onboarded_date          = :p_onboarded_date,
+            decommissioned_date     = :p_decommissioned_date,
+            notes                   = :p_notes,
+            updated_at              = :v_now,
+            updated_by              = :p_updated_by
+        WHERE source_system_id = :p_source_system_id;
 
         v_change_summary := 'UPDATE: source system ' || p_source_system_id
                          || ' (' || p_source_system_name || ') updated by ' || p_updated_by;
@@ -466,22 +456,22 @@ BEGIN
         change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        v_now, 'ref.source_system', p_source_system_id, v_action, p_updated_by, v_change_summary
+        :v_now, 'ref.source_system', :p_source_system_id, :v_action, :p_updated_by, :v_change_summary
     );
 
     SELECT MAX(change_id)
     INTO   v_change_id
     FROM   <DATABASE>.ref.change_log
     WHERE  table_name       = 'ref.source_system'
-    AND    record_id        = p_source_system_id
-    AND    change_timestamp = v_now;
+    AND    record_id        = :p_source_system_id
+    AND    change_timestamp = :v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
     v_result := (
         SELECT
-            v_action        AS action,
-            v_change_id     AS change_id,
+            :v_action       AS action,
+            :v_change_id    AS change_id,
             source_system_id,
             source_system_name,
             source_system_category,
@@ -499,7 +489,7 @@ BEGIN
             updated_at,
             updated_by
         FROM <DATABASE>.ref.source_system
-        WHERE source_system_id = p_source_system_id
+        WHERE source_system_id = :p_source_system_id
     );
 
     RETURN TABLE(v_result);
@@ -515,7 +505,7 @@ $$;
 -- Insert new subsidiary
 CALL <DATABASE>.ref.sp_upsert_entity(
     'ENT-005', 'Acme Southwest LLC', 'ACME_SW', 'SUBSIDIARY', 'ENT-001',
-    'US', 'America/Denver', TRUE, '2026-01-01'::DATE, NULL,
+    TRUE, '2026-01-01'::DATE, NULL,
     'Acquired January 2026', 'data_engineering'
 );
 
