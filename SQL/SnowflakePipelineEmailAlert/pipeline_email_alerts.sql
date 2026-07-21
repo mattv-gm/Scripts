@@ -13,7 +13,8 @@
 
 ----------------------------------------------------------------------
 -- 0. Schema setup — dedicated schema, kept independent of the ELT audit
---    framework in SQL/ELT_Log.sql so this can be deployed on its own.
+--    framework in SQL/ETLAuditLog_EntityRef/ELT_Log.sql so this can be
+--    deployed on its own.
 ----------------------------------------------------------------------
 USE DATABASE ANALYTICS_DB;
 
@@ -40,6 +41,8 @@ CREATE OR REPLACE NOTIFICATION INTEGRATION pipeline_email_alerts_int
 CREATE TABLE IF NOT EXISTS pipeline_alert_log (
     alert_id        NUMBER AUTOINCREMENT PRIMARY KEY,
     pipeline_name   VARCHAR NOT NULL,
+    environment     VARCHAR NOT NULL DEFAULT 'PROD',  -- PROD | UAT | DEV
+    execution_id    VARCHAR,  -- run/session/task ID from whatever triggered this alert, if any
     status          VARCHAR NOT NULL,
     severity        VARCHAR NOT NULL,
     message         VARCHAR,
@@ -61,10 +64,13 @@ CREATE OR REPLACE PROCEDURE send_pipeline_alert(
     p_status        VARCHAR,              -- 'SUCCESS', 'FAILURE', 'WARNING', etc. — free text, not a fixed enum
     p_message       VARCHAR,
     p_severity      VARCHAR DEFAULT 'INFO',  -- 'INFO', 'WARNING', 'ERROR'
-    p_recipients    VARCHAR DEFAULT NULL     -- comma-separated override; defaults to v_default_recipients below
+    p_recipients    VARCHAR DEFAULT NULL,    -- comma-separated override; defaults to v_default_recipients below
+    p_environment   VARCHAR DEFAULT 'PROD',  -- 'PROD', 'UAT', 'DEV'
+    p_execution_id  VARCHAR DEFAULT NULL     -- run/session/task ID from the calling job, if you have one
 )
 RETURNS VARCHAR
 LANGUAGE SQL
+COMMENT = 'Sends a pipeline alert email and logs it. Delivery failures are captured in pipeline_alert_log, not raised, so a notification problem cannot fail the calling pipeline.'
 AS
 $$
 DECLARE
@@ -79,6 +85,7 @@ DECLARE
     v_recipients       VARCHAR;
     v_integration      VARCHAR DEFAULT 'pipeline_email_alerts_int';
     v_severity_tag     VARCHAR;
+    v_environment_tag  VARCHAR;
     v_delivery_status  VARCHAR;
     v_error_message    VARCHAR DEFAULT NULL;
 BEGIN
@@ -90,24 +97,31 @@ BEGIN
         RAISE err_invalid_severity;
     END IF;
 
+    -- Environment is free-form like p_status (some accounts use custom
+    -- environment names beyond PROD/UAT/DEV), just normalized for display.
+    v_environment_tag := UPPER(:p_environment);
+
     v_recipients := COALESCE(:p_recipients, :v_default_recipients);
 
-    -- Build subject line based on severity
+    -- Build subject line based on severity — environment is included so
+    -- PROD alerts are never visually confused with DEV/UAT noise in an inbox
     CASE v_severity_tag
         WHEN 'ERROR' THEN
-            v_subject := '🚨 [ERROR] Pipeline Alert: ' || :p_pipeline_name;
+            v_subject := '🚨 [ERROR][' || :v_environment_tag || '] Pipeline Alert: ' || :p_pipeline_name;
         WHEN 'WARNING' THEN
-            v_subject := '⚠️ [WARNING] Pipeline Alert: ' || :p_pipeline_name;
+            v_subject := '⚠️ [WARNING][' || :v_environment_tag || '] Pipeline Alert: ' || :p_pipeline_name;
         ELSE
-            v_subject := 'ℹ️ [INFO] Pipeline Alert: ' || :p_pipeline_name;
+            v_subject := 'ℹ️ [INFO][' || :v_environment_tag || '] Pipeline Alert: ' || :p_pipeline_name;
     END CASE;
 
     -- Build email body
     v_body := '--- Pipeline Alert ---' || '\n\n' ||
-              'Pipeline:  ' || :p_pipeline_name || '\n' ||
-              'Status:    ' || UPPER(:p_status) || '\n' ||
-              'Severity:  ' || :v_severity_tag || '\n' ||
-              'Timestamp: ' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD HH24:MI:SS TZH:TZM') || '\n\n' ||
+              'Pipeline:     ' || :p_pipeline_name || '\n' ||
+              'Environment:  ' || :v_environment_tag || '\n' ||
+              'Execution ID: ' || COALESCE(:p_execution_id, 'n/a') || '\n' ||
+              'Status:       ' || UPPER(:p_status) || '\n' ||
+              'Severity:     ' || :v_severity_tag || '\n' ||
+              'Timestamp:    ' || TO_VARCHAR(CURRENT_TIMESTAMP(), 'YYYY-MM-DD HH24:MI:SS TZH:TZM') || '\n\n' ||
               'Message:\n' || :p_message || '\n\n' ||
               '--- End of Alert ---';
 
@@ -131,11 +145,11 @@ BEGIN
     -- Log the alert with the real outcome — never insert until we actually
     -- know whether the email went out.
     INSERT INTO pipeline_alert_log (
-        pipeline_name, status, severity, message, recipients,
+        pipeline_name, environment, execution_id, status, severity, message, recipients,
         delivery_status, error_message
     )
     VALUES (
-        :p_pipeline_name, UPPER(:p_status), :v_severity_tag, :p_message, :v_recipients,
+        :p_pipeline_name, :v_environment_tag, :p_execution_id, UPPER(:p_status), :v_severity_tag, :p_message, :v_recipients,
         :v_delivery_status, :v_error_message
     );
 
@@ -145,14 +159,14 @@ BEGIN
 
     RETURN 'Alert sent successfully: ' || :v_severity_tag || ' - ' || :p_pipeline_name;
 END;
-$$
-COMMENT = 'Sends a pipeline alert email and logs it. Delivery failures are captured in pipeline_alert_log, not raised, so a notification problem cannot fail the calling pipeline.';
+$$;
+
 
 ----------------------------------------------------------------------
 -- 4. Grant permissions (adjust role names to your environment)
 ----------------------------------------------------------------------
 -- GRANT USAGE ON INTEGRATION pipeline_email_alerts_int TO ROLE my_pipeline_role;
--- GRANT USAGE ON PROCEDURE send_pipeline_alert(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE my_pipeline_role;
+-- GRANT USAGE ON PROCEDURE send_pipeline_alert(VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR) TO ROLE my_pipeline_role;
 
 ----------------------------------------------------------------------
 -- 5. Example usage from a pipeline
@@ -172,6 +186,19 @@ CALL send_pipeline_alert(
     'FAILURE',
     'Stage file missing: @raw_stage/sales/2026-07-20/. Pipeline halted.',
     'ERROR'
+);
+
+-- Failure notification with environment + execution ID (e.g. pass the
+-- RUN_ID/PIPELINE_RUN_ID returned by SQL/ETLAuditLog_EntityRef/ELT_Log.sql,
+-- or your ELT tool's own session/task ID)
+CALL send_pipeline_alert(
+    'daily_sales_load',
+    'FAILURE',
+    'Stage file missing: @raw_stage/sales/2026-07-20/. Pipeline halted.',
+    'ERROR',
+    NULL,           -- p_recipients: use the default list
+    'PROD',         -- p_environment
+    'RUN_ID=4821'   -- p_execution_id
 );
 
 -- Warning notification
@@ -210,4 +237,9 @@ CALL send_pipeline_alert(
     'ERROR',
     'oncall@example.com, data-eng-lead@example.com'
 );
+
+-- All PROD alerts tied to one specific execution
+SELECT * FROM pipeline_alert_log
+  WHERE environment = 'PROD' AND execution_id = 'RUN_ID=4821'
+  ORDER BY sent_at DESC;
 */
