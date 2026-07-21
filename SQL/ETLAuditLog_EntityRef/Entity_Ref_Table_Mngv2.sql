@@ -2,7 +2,13 @@
 -- STORED PROCEDURES: Reference Table Management
 -- Schema:    <DATABASE>.ref
 -- Updated:   March 2026
--- Version:   1.2 — all exceptions declared in DECLARE block
+-- Version:   1.3 — all exceptions declared in DECLARE block;
+--            restored p_country_code/p_timezone on sp_upsert_entity
+--            (dropped by mistake in 1.2); change_id now generated via
+--            a sequence instead of a racy SELECT MAX(change_id).
+--
+-- This is the canonical version of these procedures. Entity_Ref_Table_Mng.sql
+-- (v1) is superseded — see the notice at the top of that file.
 -- ============================================================
 
 
@@ -10,8 +16,13 @@
 -- SECTION 0: ref.change_log
 -- ============================================================
 
+-- Explicit sequence (rather than AUTOINCREMENT) so each procedure can capture
+-- the generated change_id deterministically instead of re-querying
+-- MAX(change_id), which is racy under concurrent upserts.
+CREATE SEQUENCE IF NOT EXISTS <DATABASE>.ref.seq_change_log START = 1 INCREMENT = 1;
+
 CREATE TABLE IF NOT EXISTS <DATABASE>.ref.change_log (
-    change_id           NUMBER          AUTOINCREMENT PRIMARY KEY,
+    change_id           NUMBER          DEFAULT <DATABASE>.ref.seq_change_log.NEXTVAL PRIMARY KEY,
     change_timestamp    TIMESTAMP_NTZ   NOT NULL  DEFAULT SYSDATE(),
     table_name          VARCHAR(100)    NOT NULL,
     record_id           VARCHAR(100)    NOT NULL,
@@ -31,6 +42,8 @@ CREATE OR REPLACE PROCEDURE <DATABASE>.ref.sp_upsert_entity(
     p_entity_short_code VARCHAR,
     p_entity_type       VARCHAR,
     p_parent_entity_id  VARCHAR,
+    p_country_code      VARCHAR,
+    p_timezone          VARCHAR,
     p_is_active         BOOLEAN,
     p_effective_from    DATE,
     p_effective_to      DATE,
@@ -45,6 +58,8 @@ RETURNS TABLE (
     entity_short_code   VARCHAR,
     entity_type         VARCHAR,
     parent_entity_id    VARCHAR,
+    country_code        VARCHAR,
+    timezone            VARCHAR,
     is_active           BOOLEAN,
     effective_from      DATE,
     effective_to        DATE,
@@ -168,12 +183,14 @@ BEGIN
 
         INSERT INTO <DATABASE>.ref.entity (
             entity_id, entity_name, entity_short_code, entity_type,
-            parent_entity_id, is_active, effective_from, effective_to, notes,
+            parent_entity_id, country_code, timezone,
+            is_active, effective_from, effective_to, notes,
             created_at, updated_at, updated_by
         )
         VALUES (
             :p_entity_id, :p_entity_name, :p_entity_short_code, UPPER(:p_entity_type),
-            :p_parent_entity_id, :p_is_active, :p_effective_from, :p_effective_to, :p_notes,
+            :p_parent_entity_id, :p_country_code, :p_timezone,
+            :p_is_active, :p_effective_from, :p_effective_to, :p_notes,
             :v_now, :v_now, :p_updated_by
         );
 
@@ -188,6 +205,8 @@ BEGIN
             entity_short_code   = :p_entity_short_code,
             entity_type         = UPPER(:p_entity_type),
             parent_entity_id    = :p_parent_entity_id,
+            country_code        = :p_country_code,
+            timezone            = :p_timezone,
             is_active           = :p_is_active,
             effective_from      = :p_effective_from,
             effective_to        = :p_effective_to,
@@ -202,20 +221,17 @@ BEGIN
     END IF;
 
     -- ── Log to change_log ─────────────────────────────────────
+    -- change_id generated up front from the sequence, avoiding a racy
+    -- SELECT MAX(change_id) lookup after the insert.
+
+    v_change_id := <DATABASE>.ref.seq_change_log.NEXTVAL;
 
     INSERT INTO <DATABASE>.ref.change_log (
-        change_timestamp, table_name, record_id, action, changed_by, change_summary
+        change_id, change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        :v_now, 'ref.entity', :p_entity_id, :v_action, :p_updated_by, :v_change_summary
+        :v_change_id, :v_now, 'ref.entity', :p_entity_id, :v_action, :p_updated_by, :v_change_summary
     );
-
-    SELECT MAX(change_id)
-    INTO   v_change_id
-    FROM   <DATABASE>.ref.change_log
-    WHERE  table_name       = 'ref.entity'
-    AND    record_id        = :p_entity_id
-    AND    change_timestamp = :v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
@@ -228,6 +244,8 @@ BEGIN
             entity_short_code,
             entity_type,
             parent_entity_id,
+            country_code,
+            timezone,
             is_active,
             effective_from,
             effective_to,
@@ -451,20 +469,17 @@ BEGIN
     END IF;
 
     -- ── Log to change_log ─────────────────────────────────────
+    -- change_id generated up front from the sequence, avoiding a racy
+    -- SELECT MAX(change_id) lookup after the insert.
+
+    v_change_id := <DATABASE>.ref.seq_change_log.NEXTVAL;
 
     INSERT INTO <DATABASE>.ref.change_log (
-        change_timestamp, table_name, record_id, action, changed_by, change_summary
+        change_id, change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        :v_now, 'ref.source_system', :p_source_system_id, :v_action, :p_updated_by, :v_change_summary
+        :v_change_id, :v_now, 'ref.source_system', :p_source_system_id, :v_action, :p_updated_by, :v_change_summary
     );
-
-    SELECT MAX(change_id)
-    INTO   v_change_id
-    FROM   <DATABASE>.ref.change_log
-    WHERE  table_name       = 'ref.source_system'
-    AND    record_id        = :p_source_system_id
-    AND    change_timestamp = :v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
@@ -505,6 +520,7 @@ $$;
 -- Insert new subsidiary
 CALL <DATABASE>.ref.sp_upsert_entity(
     'ENT-005', 'Acme Southwest LLC', 'ACME_SW', 'SUBSIDIARY', 'ENT-001',
+    'US', 'America/Denver',
     TRUE, '2026-01-01'::DATE, NULL,
     'Acquired January 2026', 'data_engineering'
 );

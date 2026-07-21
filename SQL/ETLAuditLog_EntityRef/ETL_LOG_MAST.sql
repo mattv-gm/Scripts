@@ -84,8 +84,13 @@ COMMENT = 'Membership table: which jobs belong to which pipelines and in what or
 -- One row per pipeline execution. Provides the top-level view of whether
 -- the whole orchestration succeeded or failed.
 
+-- Explicit sequence (rather than AUTOINCREMENT) so sp_start_pipeline_run can
+-- capture the generated PIPELINE_RUN_ID deterministically — avoids a racy
+-- "SELECT MAX(PIPELINE_RUN_ID) WHERE ..." lookup after the insert.
+CREATE SEQUENCE IF NOT EXISTS SEQ_ELT_PIPELINE_RUN_LOG START = 1 INCREMENT = 1;
+
 CREATE TABLE IF NOT EXISTS ELT_PIPELINE_RUN_LOG (
-    PIPELINE_RUN_ID     NUMBER AUTOINCREMENT PRIMARY KEY,
+    PIPELINE_RUN_ID     NUMBER DEFAULT SEQ_ELT_PIPELINE_RUN_LOG.NEXTVAL PRIMARY KEY,
     PIPELINE_ID         NUMBER        NOT NULL REFERENCES ELT_PIPELINE_CATALOG(PIPELINE_ID),
     PIPELINE_NAME       VARCHAR(200)  NOT NULL,   -- denormalised for easy querying
     TOOL_NAME           VARCHAR(100),
@@ -207,6 +212,8 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    err_pipeline_not_found EXCEPTION (-20001, 'sp_add_job_to_pipeline: Pipeline not found or is inactive. Run sp_register_pipeline first.');
+    err_job_not_found      EXCEPTION (-20002, 'sp_add_job_to_pipeline: Job not found in catalog or is inactive. Run sp_register_job first.');
     v_pipeline_id NUMBER;
     v_job_id      NUMBER;
 BEGIN
@@ -215,7 +222,7 @@ BEGIN
     WHERE PIPELINE_NAME = :p_pipeline_name AND IS_ACTIVE = TRUE;
 
     IF (v_pipeline_id IS NULL) THEN
-        RAISE EXCEPTION 'Pipeline not found: %. Run sp_register_pipeline first.', :p_pipeline_name;
+        RAISE err_pipeline_not_found;
     END IF;
 
     SELECT JOB_ID INTO v_job_id
@@ -223,7 +230,7 @@ BEGIN
     WHERE JOB_NAME = :p_job_name AND IS_ACTIVE = TRUE;
 
     IF (v_job_id IS NULL) THEN
-        RAISE EXCEPTION 'Job not found: %. Run sp_register_job first.', :p_job_name;
+        RAISE err_job_not_found;
     END IF;
 
     MERGE INTO ELT_PIPELINE_CATALOG_JOBS AS target
@@ -267,6 +274,7 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    err_pipeline_not_found EXCEPTION (-20001, 'sp_start_pipeline_run: Pipeline not found or is inactive. Run sp_register_pipeline first.');
     v_pipeline_id     NUMBER;
     v_jobs_total      NUMBER;
     v_pipeline_run_id NUMBER;
@@ -276,7 +284,7 @@ BEGIN
     WHERE PIPELINE_NAME = :p_pipeline_name AND IS_ACTIVE = TRUE;
 
     IF (v_pipeline_id IS NULL) THEN
-        RAISE EXCEPTION 'Pipeline not found: %. Run sp_register_pipeline first.', :p_pipeline_name;
+        RAISE err_pipeline_not_found;
     END IF;
 
     -- Count how many jobs are expected in this pipeline
@@ -284,22 +292,20 @@ BEGIN
     FROM ELT_PIPELINE_CATALOG_JOBS
     WHERE PIPELINE_ID = v_pipeline_id;
 
+    -- Generate the PIPELINE_RUN_ID up front so it can be returned
+    -- deterministically — avoids a racy "SELECT MAX(...) WHERE ..." lookup.
+    v_pipeline_run_id := SEQ_ELT_PIPELINE_RUN_LOG.NEXTVAL;
+
     INSERT INTO ELT_PIPELINE_RUN_LOG (
-        PIPELINE_ID, PIPELINE_NAME, TOOL_NAME, TOOL_TASKFLOW_ID,
+        PIPELINE_RUN_ID, PIPELINE_ID, PIPELINE_NAME, TOOL_NAME, TOOL_TASKFLOW_ID,
         ENVIRONMENT, TRIGGERED_BY, TRIGGER_TYPE,
         START_TIME, STATUS, JOBS_TOTAL
     )
     VALUES (
-        v_pipeline_id, :p_pipeline_name, UPPER(:p_tool_name), :p_tool_taskflow_id,
+        :v_pipeline_run_id, v_pipeline_id, :p_pipeline_name, UPPER(:p_tool_name), :p_tool_taskflow_id,
         UPPER(:p_environment), :p_triggered_by, UPPER(:p_trigger_type),
         CURRENT_TIMESTAMP(), 'RUNNING', v_jobs_total
     );
-
-    SELECT MAX(PIPELINE_RUN_ID) INTO v_pipeline_run_id
-    FROM ELT_PIPELINE_RUN_LOG
-    WHERE PIPELINE_NAME = :p_pipeline_name
-      AND STATUS = 'RUNNING'
-      AND TRIGGERED_BY = :p_triggered_by;
 
     RETURN v_pipeline_run_id;
 END;
@@ -325,6 +331,7 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    err_invalid_status EXCEPTION (-20001, 'sp_end_pipeline_run: p_status must be one of SUCCESS, FAILED, PARTIAL, WARNING.');
     v_rows_inserted NUMBER DEFAULT 0;
     v_rows_updated  NUMBER DEFAULT 0;
     v_rows_rejected NUMBER DEFAULT 0;
@@ -334,7 +341,7 @@ DECLARE
 BEGIN
     -- Validate status
     IF (UPPER(:p_status) NOT IN ('SUCCESS', 'FAILED', 'PARTIAL', 'WARNING')) THEN
-        RAISE EXCEPTION 'Invalid status "%". Must be one of: SUCCESS, FAILED, PARTIAL, WARNING.', :p_status;
+        RAISE err_invalid_status;
     END IF;
 
     -- Aggregate stats from all child job runs in this pipeline run
@@ -393,6 +400,7 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    err_job_not_found EXCEPTION (-20001, 'sp_start_job_run: Job not found in catalog or is inactive. Run sp_register_job first.');
     v_job_id NUMBER;
     v_run_id NUMBER;
 BEGIN
@@ -401,32 +409,81 @@ BEGIN
     WHERE JOB_NAME = :p_job_name AND IS_ACTIVE = TRUE;
 
     IF (v_job_id IS NULL) THEN
-        RAISE EXCEPTION 'Job not found in catalog: %. Run sp_register_job first.', :p_job_name;
+        RAISE err_job_not_found;
     END IF;
 
+    -- Generate the RUN_ID up front (same SEQ_ELT_JOB_RUN_LOG sequence used by
+    -- the table default) instead of re-querying MAX(RUN_ID) after the insert.
+    v_run_id := SEQ_ELT_JOB_RUN_LOG.NEXTVAL;
+
     INSERT INTO ELT_JOB_RUN_LOG (
-        JOB_ID, JOB_NAME, TOOL_NAME, TOOL_JOB_ID,
+        RUN_ID, JOB_ID, JOB_NAME, TOOL_NAME, TOOL_JOB_ID,
         ENVIRONMENT, START_TIME, STATUS,
         TRIGGERED_BY, LOAD_WINDOW_START, LOAD_WINDOW_END,
         PIPELINE_RUN_ID, STEP_NUMBER
     )
     VALUES (
-        v_job_id, :p_job_name, UPPER(:p_tool_name), :p_tool_job_id,
+        :v_run_id, v_job_id, :p_job_name, UPPER(:p_tool_name), :p_tool_job_id,
         UPPER(:p_environment), CURRENT_TIMESTAMP(), 'RUNNING',
         :p_triggered_by, :p_load_window_start, :p_load_window_end,
         :p_pipeline_run_id, :p_step_number
     );
 
-    SELECT MAX(RUN_ID) INTO v_run_id
-    FROM ELT_JOB_RUN_LOG
-    WHERE JOB_NAME    = :p_job_name
-      AND STATUS      = 'RUNNING'
-      AND TRIGGERED_BY = :p_triggered_by;
-
     RETURN v_run_id;
 END;
 $$
 COMMENT = 'Opens a job run record. Pass p_pipeline_run_id to link to a parent pipeline run.';
+
+
+-- ── 2f. RECORD A SKIPPED OPTIONAL JOB ──────────────────────────────────────
+-- Call instead of sp_start_job_run/sp_end_job_run when an IS_OPTIONAL step is
+-- deliberately skipped (e.g. a month-end-only job on a non-month-end day).
+-- Without this, ELT_JOB_RUN_LOG never gets a 'SKIPPED' row, so
+-- sp_end_pipeline_run's JOBS_SKIPPED count can never be anything but zero.
+
+CREATE OR REPLACE PROCEDURE sp_skip_job_run(
+    p_job_name          VARCHAR,
+    p_tool_name         VARCHAR,
+    p_environment       VARCHAR,
+    p_triggered_by      VARCHAR,
+    p_pipeline_run_id   NUMBER,
+    p_step_number       NUMBER,
+    p_reason            VARCHAR DEFAULT NULL
+)
+RETURNS NUMBER  -- returns the new RUN_ID
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    err_job_not_found EXCEPTION (-20001, 'sp_skip_job_run: Job not found in catalog or is inactive. Run sp_register_job first.');
+    v_job_id NUMBER;
+    v_run_id NUMBER;
+BEGIN
+    SELECT JOB_ID INTO v_job_id
+    FROM ELT_JOB_CATALOG
+    WHERE JOB_NAME = :p_job_name AND IS_ACTIVE = TRUE;
+
+    IF (v_job_id IS NULL) THEN
+        RAISE err_job_not_found;
+    END IF;
+
+    v_run_id := SEQ_ELT_JOB_RUN_LOG.NEXTVAL;
+
+    INSERT INTO ELT_JOB_RUN_LOG (
+        RUN_ID, JOB_ID, JOB_NAME, TOOL_NAME,
+        ENVIRONMENT, START_TIME, END_TIME, STATUS,
+        TRIGGERED_BY, NOTES, PIPELINE_RUN_ID, STEP_NUMBER
+    )
+    VALUES (
+        :v_run_id, v_job_id, :p_job_name, UPPER(:p_tool_name),
+        UPPER(:p_environment), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 'SKIPPED',
+        :p_triggered_by, :p_reason, :p_pipeline_run_id, :p_step_number
+    );
+
+    RETURN v_run_id;
+END;
+$$
+COMMENT = 'Records that an optional pipeline step was skipped, so JOBS_SKIPPED and VW_PIPELINE_JOB_BREAKDOWN reflect it.';
 
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -435,6 +492,7 @@ COMMENT = 'Opens a job run record. Pass p_pipeline_run_id to link to a parent pi
 
 -- ── 3a. PIPELINE RUN SUMMARY ───────────────────────────────────────────────
 -- Top-level health check across all pipelines.
+-- Scoped to PROD runs only — see VW_JOB_SUMMARY in ELT_Log.sql for why.
 
 CREATE OR REPLACE VIEW VW_PIPELINE_RUN_SUMMARY AS
 SELECT
@@ -454,7 +512,7 @@ SELECT
     ROUND(AVG(r.DURATION_SECONDS), 0)                                  AS AVG_DURATION_SECONDS,
     SUM(r.TOTAL_ROWS_INSERTED)                                         AS ALL_TIME_ROWS_INSERTED
 FROM ELT_PIPELINE_CATALOG c
-LEFT JOIN ELT_PIPELINE_RUN_LOG r ON c.PIPELINE_ID = r.PIPELINE_ID
+LEFT JOIN ELT_PIPELINE_RUN_LOG r ON c.PIPELINE_ID = r.PIPELINE_ID AND r.ENVIRONMENT = 'PROD'
 WHERE c.IS_ACTIVE = TRUE
 GROUP BY 1,2,3,4
 ORDER BY c.PIPELINE_NAME;
@@ -613,6 +671,20 @@ CALL sp_end_job_run(
 );
 
 -- Repeat sp_start_job_run / sp_end_job_run for steps 2, 3, 4...
+
+-- If an optional step is skipped instead of run (e.g. LOAD_TRIAL_BALANCE on a
+-- non-month-end day), record it with sp_skip_job_run so JOBS_SKIPPED and
+-- VW_PIPELINE_JOB_BREAKDOWN reflect it — otherwise it just looks like the
+-- step never happened.
+CALL sp_skip_job_run(
+    'LOAD_TRIAL_BALANCE',
+    'INFORMATICA_IICS',
+    'PROD',
+    'svc_informatica',
+    7,     -- v_pipeline_run_id
+    4,     -- step number
+    'Skipped — not month-end'
+);
 
 -- At the END of the Taskflow — SUCCESS path:
 CALL sp_end_pipeline_run(

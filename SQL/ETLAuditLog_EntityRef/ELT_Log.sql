@@ -74,8 +74,13 @@ COMMENT = 'Master catalog of all registered ELT jobs.';
 -- One row per execution attempt. This is the core audit trail.
 -- TOOL_NAME is what makes the framework tool-agnostic — it is just a value.
 
+-- Explicit sequence (rather than AUTOINCREMENT) so sp_start_job_run can capture
+-- the generated RUN_ID deterministically instead of re-querying MAX(RUN_ID),
+-- which is racy when the same job/service account starts two runs at once.
+CREATE SEQUENCE IF NOT EXISTS SEQ_ELT_JOB_RUN_LOG START = 1 INCREMENT = 1;
+
 CREATE TABLE IF NOT EXISTS ELT_JOB_RUN_LOG (
-    RUN_ID              NUMBER AUTOINCREMENT PRIMARY KEY,
+    RUN_ID              NUMBER DEFAULT SEQ_ELT_JOB_RUN_LOG.NEXTVAL PRIMARY KEY,
     JOB_ID              NUMBER        NOT NULL REFERENCES ELT_JOB_CATALOG(JOB_ID),
     JOB_NAME            VARCHAR(200)  NOT NULL,  -- denormalised for easy querying
     TOOL_NAME           VARCHAR(100)  NOT NULL,  -- 'INFORMATICA' | 'MATILLION' | 'DBT' etc.
@@ -90,8 +95,11 @@ CREATE TABLE IF NOT EXISTS ELT_JOB_RUN_LOG (
                         ),  -- computed automatically
 
     -- Outcome
-    STATUS              VARCHAR(20)   NOT NULL    -- RUNNING | SUCCESS | FAILED | WARNING
-                            CHECK (STATUS IN ('RUNNING','SUCCESS','FAILED','WARNING')),
+    -- Valid values: RUNNING | SUCCESS | FAILED | WARNING | SKIPPED
+    -- CHECK is metadata-only in Snowflake (never enforced) — actual validation
+    -- happens in sp_end_job_run() and sp_skip_job_run() (see ETL_LOG_MAST.sql).
+    STATUS              VARCHAR(20)   NOT NULL
+                            CHECK (STATUS IN ('RUNNING','SUCCESS','FAILED','WARNING','SKIPPED')),
     ROWS_EXTRACTED      NUMBER DEFAULT 0,
     ROWS_INSERTED       NUMBER DEFAULT 0,
     ROWS_UPDATED        NUMBER DEFAULT 0,
@@ -209,6 +217,7 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    err_job_not_found EXCEPTION (-20001, 'sp_start_job_run: Job not found in catalog or is inactive. Run sp_register_job first.');
     v_job_id NUMBER;
     v_run_id NUMBER;
 BEGIN
@@ -218,27 +227,23 @@ BEGIN
     WHERE JOB_NAME = :p_job_name AND IS_ACTIVE = TRUE;
 
     IF (v_job_id IS NULL) THEN
-        RAISE EXCEPTION 'Job not found in catalog: %. Run sp_register_job first.', :p_job_name;
+        RAISE err_job_not_found;
     END IF;
 
-    -- Insert the run record with status RUNNING
+    -- Generate the RUN_ID up front so it can be returned deterministically —
+    -- avoids a racy "SELECT MAX(RUN_ID) WHERE ..." lookup after the insert.
+    v_run_id := SEQ_ELT_JOB_RUN_LOG.NEXTVAL;
+
     INSERT INTO ELT_JOB_RUN_LOG (
-        JOB_ID, JOB_NAME, TOOL_NAME, TOOL_JOB_ID,
+        RUN_ID, JOB_ID, JOB_NAME, TOOL_NAME, TOOL_JOB_ID,
         ENVIRONMENT, START_TIME, STATUS,
         TRIGGERED_BY, LOAD_WINDOW_START, LOAD_WINDOW_END
     )
     VALUES (
-        v_job_id, :p_job_name, UPPER(:p_tool_name), :p_tool_job_id,
+        :v_run_id, v_job_id, :p_job_name, UPPER(:p_tool_name), :p_tool_job_id,
         UPPER(:p_environment), CURRENT_TIMESTAMP(), 'RUNNING',
         :p_triggered_by, :p_load_window_start, :p_load_window_end
     );
-
-    -- Return the new RUN_ID so the caller can pass it to sp_end_job_run
-    SELECT MAX(RUN_ID) INTO v_run_id
-    FROM ELT_JOB_RUN_LOG
-    WHERE JOB_NAME = :p_job_name
-      AND STATUS = 'RUNNING'
-      AND TRIGGERED_BY = :p_triggered_by;
 
     RETURN v_run_id;
 END;
@@ -265,7 +270,15 @@ RETURNS VARCHAR
 LANGUAGE SQL
 AS
 $$
+DECLARE
+    -- Snowflake's CHECK constraint on ELT_JOB_RUN_LOG.STATUS is metadata-only
+    -- and is never enforced, so this procedure is the only real gate.
+    err_invalid_status EXCEPTION (-20001, 'sp_end_job_run: p_status must be one of SUCCESS, FAILED, WARNING.');
 BEGIN
+    IF (UPPER(:p_status) NOT IN ('SUCCESS', 'FAILED', 'WARNING')) THEN
+        RAISE err_invalid_status;
+    END IF;
+
     UPDATE ELT_JOB_RUN_LOG
     SET
         END_TIME        = CURRENT_TIMESTAMP(),
@@ -302,7 +315,15 @@ RETURNS VARCHAR
 LANGUAGE SQL
 AS
 $$
+DECLARE
+    -- Snowflake's CHECK constraint on ELT_ERROR_LOG.ERROR_SEVERITY is
+    -- metadata-only and is never enforced, so this procedure is the only real gate.
+    err_invalid_severity EXCEPTION (-20001, 'sp_log_error: p_error_severity must be one of INFO, WARNING, ERROR, CRITICAL.');
 BEGIN
+    IF (UPPER(:p_error_severity) NOT IN ('INFO', 'WARNING', 'ERROR', 'CRITICAL')) THEN
+        RAISE err_invalid_severity;
+    END IF;
+
     INSERT INTO ELT_ERROR_LOG (
         RUN_ID, JOB_NAME, ERROR_SEVERITY,
         ERROR_CODE, ERROR_MESSAGE, ERROR_DETAIL, SOURCE_RECORD
@@ -326,6 +347,8 @@ COMMENT = 'Log an error against an active job run. Call multiple times if needed
 
 -- ── 4a. JOB SUMMARY ────────────────────────────────────────────────────────
 -- High-level dashboard: last run status, success rate, total rows loaded.
+-- Scoped to PROD runs only — without this, a flaky DEV/UAT run would skew
+-- the success rate meant to represent production health.
 
 CREATE OR REPLACE VIEW VW_JOB_SUMMARY AS
 SELECT
@@ -347,7 +370,7 @@ SELECT
     SUM(r.ROWS_UPDATED)                         AS TOTAL_ROWS_UPDATED,
     AVG(r.DURATION_SECONDS)                     AS AVG_DURATION_SECONDS
 FROM ELT_JOB_CATALOG c
-LEFT JOIN ELT_JOB_RUN_LOG r ON c.JOB_ID = r.JOB_ID
+LEFT JOIN ELT_JOB_RUN_LOG r ON c.JOB_ID = r.JOB_ID AND r.ENVIRONMENT = 'PROD'
 WHERE c.IS_ACTIVE = TRUE
 GROUP BY 1,2,3,4,5
 ORDER BY c.JOB_NAME;
@@ -415,35 +438,44 @@ CREATE OR REPLACE VIEW VW_ROW_COUNT_ANOMALIES AS
 WITH job_stats AS (
     SELECT
         JOB_NAME,
-        AVG(ROWS_INSERTED)   AS avg_rows,
+        AVG(ROWS_INSERTED)    AS avg_rows,
         STDDEV(ROWS_INSERTED) AS stddev_rows
     FROM ELT_JOB_RUN_LOG
     WHERE STATUS = 'SUCCESS' AND ROWS_INSERTED > 0
     GROUP BY JOB_NAME
     HAVING COUNT(*) >= 5  -- only flag when we have enough history
+),
+scored_runs AS (
+    -- Compute the z-score once here so SELECT/WHERE/ORDER BY below reuse the
+    -- same column instead of recomputing the expression 3x per row.
+    SELECT
+        r.RUN_ID,
+        r.JOB_NAME,
+        r.START_TIME,
+        r.ROWS_INSERTED,
+        s.avg_rows,
+        s.stddev_rows,
+        (r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0) AS z_score
+    FROM ELT_JOB_RUN_LOG r
+    JOIN job_stats s ON r.JOB_NAME = s.JOB_NAME
+    WHERE r.STATUS = 'SUCCESS'
 )
 SELECT
-    r.RUN_ID,
-    r.JOB_NAME,
-    r.START_TIME,
-    r.ROWS_INSERTED,
-    ROUND(s.avg_rows, 0)     AS historical_avg_rows,
-    ROUND(s.stddev_rows, 0)  AS historical_stddev,
-    ROUND(
-        (r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0), 2
-    )                        AS z_score,  -- how many std deviations from normal
+    RUN_ID,
+    JOB_NAME,
+    START_TIME,
+    ROWS_INSERTED,
+    ROUND(avg_rows, 0)    AS historical_avg_rows,
+    ROUND(stddev_rows, 0) AS historical_stddev,
+    ROUND(z_score, 2)     AS z_score,  -- how many std deviations from normal
     CASE
-        WHEN ABS((r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0)) > 3
-        THEN 'CRITICAL ANOMALY'
-        WHEN ABS((r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0)) > 2
-        THEN 'WARNING'
+        WHEN ABS(z_score) > 3 THEN 'CRITICAL ANOMALY'
+        WHEN ABS(z_score) > 2 THEN 'WARNING'
         ELSE 'NORMAL'
-    END                      AS anomaly_flag
-FROM ELT_JOB_RUN_LOG r
-JOIN job_stats s ON r.JOB_NAME = s.JOB_NAME
-WHERE r.STATUS = 'SUCCESS'
-  AND ABS((r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0)) > 2
-ORDER BY ABS((r.ROWS_INSERTED - s.avg_rows) / NULLIF(s.stddev_rows, 0)) DESC;
+    END                   AS anomaly_flag
+FROM scored_runs
+WHERE ABS(z_score) > 2
+ORDER BY ABS(z_score) DESC;
 
 
 /* ─────────────────────────────────────────────────────────────────────────────

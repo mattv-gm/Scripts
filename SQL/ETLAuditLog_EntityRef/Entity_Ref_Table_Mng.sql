@@ -3,6 +3,12 @@
 -- Schema:    <DATABASE>.ref
 -- Updated:   March 2026
 --
+-- NOTE: Entity_Ref_Table_Mngv2.sql is the current, actively maintained
+-- version of these procedures (adds p_country_code/p_timezone parity and
+-- generates change_id via a sequence). Both files CREATE OR REPLACE the
+-- same procedure names, so whichever one you run last "wins" — keep that
+-- in mind if you run them out of order.
+--
 -- Procedures:
 --   1. sp_upsert_entity        — insert or update ref.entity
 --   2. sp_upsert_source_system — insert or update ref.source_system
@@ -25,8 +31,13 @@
 -- SECTION 0: ref.change_log (audit trail for both procedures)
 -- ============================================================
 
+-- Explicit sequence (rather than AUTOINCREMENT) so each procedure can capture
+-- the generated change_id deterministically instead of re-querying
+-- MAX(change_id), which is racy under concurrent upserts.
+CREATE SEQUENCE IF NOT EXISTS <DATABASE>.ref.seq_change_log START = 1 INCREMENT = 1;
+
 CREATE TABLE IF NOT EXISTS <DATABASE>.ref.change_log (
-    change_id           NUMBER          AUTOINCREMENT PRIMARY KEY,
+    change_id           NUMBER          DEFAULT <DATABASE>.ref.seq_change_log.NEXTVAL PRIMARY KEY,
     change_timestamp    TIMESTAMP_NTZ   NOT NULL  DEFAULT SYSDATE(),
     table_name          VARCHAR(100)    NOT NULL,   -- ref.entity or ref.source_system
     record_id           VARCHAR(100)    NOT NULL,   -- entity_id or source_system_id
@@ -102,6 +113,21 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    -- RAISE in Snowflake Scripting only accepts the name of a previously
+    -- DECLAREd exception — it does not support inline 'message %', arg
+    -- interpolation. Each validation failure below gets its own declared
+    -- exception with a fixed, descriptive message instead.
+    err_entity_id_required      EXCEPTION (-20001, 'sp_upsert_entity: p_entity_id is required and cannot be empty.');
+    err_entity_name_required    EXCEPTION (-20002, 'sp_upsert_entity: p_entity_name is required and cannot be empty.');
+    err_short_code_required     EXCEPTION (-20003, 'sp_upsert_entity: p_entity_short_code is required and cannot be empty.');
+    err_updated_by_required     EXCEPTION (-20004, 'sp_upsert_entity: p_updated_by is required and cannot be empty.');
+    err_effective_from_required EXCEPTION (-20005, 'sp_upsert_entity: p_effective_from is required.');
+    err_invalid_entity_type     EXCEPTION (-20006, 'sp_upsert_entity: p_entity_type must be HOLDING or SUBSIDIARY.');
+    err_holding_has_parent      EXCEPTION (-20007, 'sp_upsert_entity: A HOLDING entity must have p_parent_entity_id = NULL.');
+    err_subsidiary_needs_parent EXCEPTION (-20008, 'sp_upsert_entity: A SUBSIDIARY entity requires a valid p_parent_entity_id.');
+    err_parent_not_found        EXCEPTION (-20009, 'sp_upsert_entity: p_parent_entity_id does not exist in ref.entity.');
+    err_parent_inactive         EXCEPTION (-20010, 'sp_upsert_entity: p_parent_entity_id exists but is inactive. Cannot set an inactive entity as parent.');
+
     v_action            VARCHAR;
     v_existing_count    INTEGER;
     v_parent_count      INTEGER;
@@ -114,37 +140,37 @@ BEGIN
     -- ── Input validation ──────────────────────────────────────
 
     IF (p_entity_id IS NULL OR TRIM(p_entity_id) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_entity_id is required and cannot be empty.';
+        RAISE err_entity_id_required;
     END IF;
 
     IF (p_entity_name IS NULL OR TRIM(p_entity_name) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_entity_name is required and cannot be empty.';
+        RAISE err_entity_name_required;
     END IF;
 
     IF (p_entity_short_code IS NULL OR TRIM(p_entity_short_code) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_entity_short_code is required and cannot be empty.';
+        RAISE err_short_code_required;
     END IF;
 
     IF (p_updated_by IS NULL OR TRIM(p_updated_by) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_updated_by is required and cannot be empty.';
+        RAISE err_updated_by_required;
     END IF;
 
     IF (p_effective_from IS NULL) THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_effective_from is required.';
+        RAISE err_effective_from_required;
     END IF;
 
     -- ── entity_type validation ────────────────────────────────
 
     IF (UPPER(p_entity_type) NOT IN ('HOLDING', 'SUBSIDIARY')) THEN
-        RAISE EXCEPTION 'sp_upsert_entity: p_entity_type must be HOLDING or SUBSIDIARY. Received: %', p_entity_type;
+        RAISE err_invalid_entity_type;
     END IF;
 
     IF (UPPER(p_entity_type) = 'HOLDING' AND p_parent_entity_id IS NOT NULL) THEN
-        RAISE EXCEPTION 'sp_upsert_entity: A HOLDING entity must have p_parent_entity_id = NULL. Received: %', p_parent_entity_id;
+        RAISE err_holding_has_parent;
     END IF;
 
     IF (UPPER(p_entity_type) = 'SUBSIDIARY' AND (p_parent_entity_id IS NULL OR TRIM(p_parent_entity_id) = '')) THEN
-        RAISE EXCEPTION 'sp_upsert_entity: A SUBSIDIARY entity requires a valid p_parent_entity_id.';
+        RAISE err_subsidiary_needs_parent;
     END IF;
 
     -- ── parent_entity_id existence + active check ─────────────
@@ -157,7 +183,7 @@ BEGIN
         WHERE  entity_id = p_parent_entity_id;
 
         IF (v_parent_count = 0) THEN
-            RAISE EXCEPTION 'sp_upsert_entity: p_parent_entity_id "%" does not exist in ref.entity.', p_parent_entity_id;
+            RAISE err_parent_not_found;
         END IF;
 
         SELECT is_active
@@ -166,7 +192,7 @@ BEGIN
         WHERE  entity_id = p_parent_entity_id;
 
         IF (NOT v_parent_active) THEN
-            RAISE EXCEPTION 'sp_upsert_entity: p_parent_entity_id "%" exists but is inactive. Cannot set an inactive entity as parent.', p_parent_entity_id;
+            RAISE err_parent_inactive;
         END IF;
 
     END IF;
@@ -226,19 +252,17 @@ BEGIN
     END IF;
 
     -- ── Log to change_log ─────────────────────────────────────
+    -- change_id generated up front from the sequence, avoiding a racy
+    -- SELECT MAX(change_id) lookup after the insert.
+
+    v_change_id := <DATABASE>.ref.seq_change_log.NEXTVAL;
 
     INSERT INTO <DATABASE>.ref.change_log (
-        change_timestamp, table_name, record_id, action, changed_by, change_summary
+        change_id, change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        v_now, 'ref.entity', p_entity_id, v_action, p_updated_by, v_change_summary
+        v_change_id, v_now, 'ref.entity', p_entity_id, v_action, p_updated_by, v_change_summary
     );
-
-    SELECT MAX(change_id) INTO v_change_id
-    FROM   <DATABASE>.ref.change_log
-    WHERE  table_name = 'ref.entity'
-    AND    record_id  = p_entity_id
-    AND    change_timestamp = v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
@@ -341,6 +365,22 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
+    -- RAISE in Snowflake Scripting only accepts the name of a previously
+    -- DECLAREd exception — it does not support inline 'message %', arg
+    -- interpolation. Each validation failure below gets its own declared
+    -- exception with a fixed, descriptive message instead.
+    err_ss_id_required          EXCEPTION (-20001, 'sp_upsert_source_system: p_source_system_id is required and cannot be empty.');
+    err_ss_name_required        EXCEPTION (-20002, 'sp_upsert_source_system: p_source_system_name is required and cannot be empty.');
+    err_updated_by_required     EXCEPTION (-20003, 'sp_upsert_source_system: p_updated_by is required and cannot be empty.');
+    err_onboarded_date_required EXCEPTION (-20004, 'sp_upsert_source_system: p_onboarded_date is required.');
+    err_id_not_lowercase        EXCEPTION (-20005, 'sp_upsert_source_system: p_source_system_id must be lowercase snake_case (e.g. oracle_erp). Uppercase characters are not allowed.');
+    err_id_has_spaces           EXCEPTION (-20006, 'sp_upsert_source_system: p_source_system_id must not contain spaces. Use underscores (e.g. oracle_erp).');
+    err_invalid_category        EXCEPTION (-20007, 'sp_upsert_source_system: p_source_system_category must be one of: CRM, ERP, FILE, API, DATABASE, INTERNAL.');
+    err_invalid_connection_type EXCEPTION (-20008, 'sp_upsert_source_system: p_connection_type must be one of: JDBC, REST_API, S3, SFTP, SNOWPIPE, INTERNAL.');
+    err_invalid_environment     EXCEPTION (-20009, 'sp_upsert_source_system: p_environment must be one of: PROD, UAT, DEV.');
+    err_entity_not_found        EXCEPTION (-20010, 'sp_upsert_source_system: p_owning_entity_id does not exist in ref.entity.');
+    err_entity_inactive         EXCEPTION (-20011, 'sp_upsert_source_system: p_owning_entity_id exists but is inactive. Cannot assign an inactive entity as owner.');
+
     v_action            VARCHAR;
     v_existing_count    INTEGER;
     v_entity_count      INTEGER;
@@ -353,50 +393,50 @@ BEGIN
     -- ── Input validation ──────────────────────────────────────
 
     IF (p_source_system_id IS NULL OR TRIM(p_source_system_id) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_source_system_id is required and cannot be empty.';
+        RAISE err_ss_id_required;
     END IF;
 
     IF (p_source_system_name IS NULL OR TRIM(p_source_system_name) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_source_system_name is required and cannot be empty.';
+        RAISE err_ss_name_required;
     END IF;
 
     IF (p_updated_by IS NULL OR TRIM(p_updated_by) = '') THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_updated_by is required and cannot be empty.';
+        RAISE err_updated_by_required;
     END IF;
 
     IF (p_onboarded_date IS NULL) THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_onboarded_date is required.';
+        RAISE err_onboarded_date_required;
     END IF;
 
     -- ── source_system_id format check (lowercase snake_case) ──
     -- Reject if it contains uppercase letters or spaces
 
     IF (p_source_system_id != LOWER(p_source_system_id)) THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_source_system_id must be lowercase. Received: "%". Use snake_case (e.g. oracle_erp, s3_file_drop).', p_source_system_id;
+        RAISE err_id_not_lowercase;
     END IF;
 
     IF (p_source_system_id LIKE '% %') THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_source_system_id must not contain spaces. Use underscores (e.g. oracle_erp).';
+        RAISE err_id_has_spaces;
     END IF;
 
     -- ── category validation ───────────────────────────────────
 
     IF (UPPER(p_source_system_category) NOT IN ('CRM', 'ERP', 'FILE', 'API', 'DATABASE', 'INTERNAL')) THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_source_system_category must be one of CRM, ERP, FILE, API, DATABASE, INTERNAL. Received: "%".', p_source_system_category;
+        RAISE err_invalid_category;
     END IF;
 
     -- ── connection_type validation (when provided) ────────────
 
     IF (p_connection_type IS NOT NULL
         AND UPPER(p_connection_type) NOT IN ('JDBC', 'REST_API', 'S3', 'SFTP', 'SNOWPIPE', 'INTERNAL')) THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_connection_type must be one of JDBC, REST_API, S3, SFTP, SNOWPIPE, INTERNAL. Received: "%".', p_connection_type;
+        RAISE err_invalid_connection_type;
     END IF;
 
     -- ── environment validation (when provided) ────────────────
 
     IF (p_environment IS NOT NULL
         AND UPPER(p_environment) NOT IN ('PROD', 'UAT', 'DEV')) THEN
-        RAISE EXCEPTION 'sp_upsert_source_system: p_environment must be PROD, UAT, or DEV. Received: "%".', p_environment;
+        RAISE err_invalid_environment;
     END IF;
 
     -- ── owning_entity_id existence + active check ─────────────
@@ -409,7 +449,7 @@ BEGIN
         WHERE  entity_id = p_owning_entity_id;
 
         IF (v_entity_count = 0) THEN
-            RAISE EXCEPTION 'sp_upsert_source_system: p_owning_entity_id "%" does not exist in ref.entity.', p_owning_entity_id;
+            RAISE err_entity_not_found;
         END IF;
 
         SELECT is_active
@@ -418,7 +458,7 @@ BEGIN
         WHERE  entity_id = p_owning_entity_id;
 
         IF (NOT v_entity_active) THEN
-            RAISE EXCEPTION 'sp_upsert_source_system: p_owning_entity_id "%" exists but is inactive. Cannot assign an inactive entity as owner.', p_owning_entity_id;
+            RAISE err_entity_inactive;
         END IF;
 
     END IF;
@@ -484,19 +524,17 @@ BEGIN
     END IF;
 
     -- ── Log to change_log ─────────────────────────────────────
+    -- change_id generated up front from the sequence, avoiding a racy
+    -- SELECT MAX(change_id) lookup after the insert.
+
+    v_change_id := <DATABASE>.ref.seq_change_log.NEXTVAL;
 
     INSERT INTO <DATABASE>.ref.change_log (
-        change_timestamp, table_name, record_id, action, changed_by, change_summary
+        change_id, change_timestamp, table_name, record_id, action, changed_by, change_summary
     )
     VALUES (
-        v_now, 'ref.source_system', p_source_system_id, v_action, p_updated_by, v_change_summary
+        v_change_id, v_now, 'ref.source_system', p_source_system_id, v_action, p_updated_by, v_change_summary
     );
-
-    SELECT MAX(change_id) INTO v_change_id
-    FROM   <DATABASE>.ref.change_log
-    WHERE  table_name = 'ref.source_system'
-    AND    record_id  = p_source_system_id
-    AND    change_timestamp = v_now;
 
     -- ── Return full row summary ───────────────────────────────
 
